@@ -1,0 +1,35 @@
+
+node_modules/
+dist/
+.vite/
+data/
+.env
+.env.*
+!.env.example
+
+# Logs and local debugging
+*.log
+snap.txt
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Temporary debugging and repair scripts
+/check-*.js
+/check-*.cjs
+/debug*.cjs
+/fix-*.cjs
+/fixes/
+
+# Local test scripts that may contain test credentials
+/test-*.js
+/test-*.cjs
+/test-*.test.js
+/set-test-code.cjs
+/create-tables.mjs
+/inspect-db.js
+/check-db2.mjs
