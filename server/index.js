@@ -95,24 +95,18 @@ const resetPasswordBodySchema = {
 const userFields =
   "users.id, users.name, users.email, users.mobile, users.created_at AS createdAt";
 
+
+
 async function deliverVerificationCode({ channel, destination, code }) {
   if (channel !== "email") {
     throw new Error("Only email verification is enabled.");
   }
 
-  const { SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, SMTP_FROM } =
-    process.env;
+  const { RESEND_API_KEY, RESEND_FROM } = process.env;
 
-  if (!SMTP_HOST || !SMTP_FROM || Boolean(SMTP_USER) !== Boolean(SMTP_PASS)) {
-    throw new Error("Email delivery is not configured.");
+  if (!RESEND_API_KEY || !RESEND_FROM) {
+    throw new Error("Resend email delivery is not configured.");
   }
-
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT || 587),
-    secure: SMTP_SECURE === "true" || Number(SMTP_PORT) === 465,
-    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-  });
 
   const htmlContent = `
 <!DOCTYPE html>
@@ -121,42 +115,54 @@ async function deliverVerificationCode({ channel, destination, code }) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
   <div style="background: linear-gradient(135deg, #059669, #0f766e); padding: 30px; text-align: center; border-radius: 12px 12px 0 0;">
-    <h1 style="color: white; margin: 0; font-size: 24px;">Shri Radhe</h1>
-    <h3 style="color: white; margin: 0; font-size: 14px;">Wellness</h3>
-    <p style="color: #a7f3d0; margin: 10px 0 0;">Premium Nutrition & Wellness</p>
+    <h1 style="color: white; margin: 0;">Shri Radhe</h1>
+    <h3 style="color: white; margin: 0;">Wellness</h3>
+    <p style="color: #a7f3d0;">Premium Nutrition & Wellness</p>
   </div>
-  <div style="background: #f8fafc; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e2e8f0;">
-    <h2 style="color: #1e293b; margin-top: 0;">Verify Your Email</h2>
-    <p style="font-size: 16px;">Welcome to Shri Radhe Wellness! Please use the code below to verify your email address:</p>
-    <div style="background: #059669; color: white; font-size: 32px; font-weight: bold; letter-spacing: 8px; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0; font-family: monospace;">
+  <div style="background: #f8fafc; padding: 30px; border: 1px solid #e2e8f0;">
+    <h2>Verify Your Email</h2>
+    <p>Welcome to Shri Radhe Wellness! Use this code to verify your email address:</p>
+    <div style="background: #059669; color: white; font-size: 32px; font-weight: bold; letter-spacing: 8px; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
       ${code}
     </div>
-    <p style="color: #64748b; font-size: 14px;">This code expires in <strong>10 minutes</strong>.</p>
-    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;">
-    <p style="color: #94a3b8; font-size: 12px;">If you didn't request this code, please ignore this email or contact support.</p>
-    <p style="color: #94a3b8; font-size: 12px;">— The Shri Radhe Wellness Team</p>
+    <p>This code expires in <strong>10 minutes</strong>.</p>
+    <hr>
+    <p style="color: #64748b; font-size: 12px;">If you didn't request this code, you can ignore this email.</p>
+    <p style="color: #64748b; font-size: 12px;">— The Shri Radhe Wellness Team</p>
   </div>
 </body>
-</html>
-  `;
+</html>`;
 
-  await transporter.sendMail({
-    from: `"Shri Radhe Wellness Centre" <${SMTP_FROM}>`,
-    to: destination,
-    subject: "Welcome to Shri Radhe Wellness Centre",
-    text: `Your Shri Radhe Wellness verification code is ${code}.
-    It expires in 10 minutes.`,
-    html: htmlContent,
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
     headers: {
-      'X-Priority': '3',
-      'X-Mailer': 'Shri Radhe Wellness',
-      'Precedence': 'bulk',
-      'List-Unsubscribe': '<mailto:unsubscribe@mayleen.com>',
-    }
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM,
+      to: [destination],
+      subject: "Your Shri Radhe Wellness verification code",
+      text: `Your verification code is ${code}. It expires in 10 minutes.`,
+      html: htmlContent,
+    }),
+    signal: AbortSignal.timeout(15000),
   });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error(
+      "Resend email delivery failed:",
+      response.status,
+      details
+    );
+    throw new Error(`Resend API returned HTTP ${response.status}`);
+  }
 }
+
+
 
 function normalizeUser(row) {
   return {
