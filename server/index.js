@@ -3129,7 +3129,7 @@ const isMainModule =
 if (isMainModule) {
   const app = await createAuthServer();
   const port = Number(process.env.PORT || 3001);
-  const host = process.env.HOST || "0.0.0.0";
+  const host = "0.0.0.0";
 
   try {
     await app.listen({ port, host });
