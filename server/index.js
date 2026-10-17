@@ -4,7 +4,8 @@ import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import staticFiles from "@fastify/static";
-import Database from "better-sqlite3";
+import pg from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
 import nodemailer from "nodemailer";
 import {
   createHash,
@@ -15,7 +16,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProductPrice } from "./product-prices.js";
@@ -222,8 +223,148 @@ function setAdminSessionCookie(reply, token, secure) {
   });
 }
 
+// PostgreSQL compatibility helpers. Existing route SQL keeps '?' placeholders;
+// these helpers convert them to PostgreSQL's $1, $2, ... parameters safely.
+const { Pool, types } = pg;
+// BIGINT values in this app are millisecond timestamps, money-in-minor-units, or IDs,
+// all of which stay within JavaScript's safe-integer range for this project.
+types.setTypeParser(20, (value) => Number(value));
+
+function postgresSql(sql) {
+  // PostgreSQL folds unquoted camelCase aliases to lowercase; quote aliases so the
+  // existing API response property names (for example createdAt) remain unchanged.
+  const aliasSafeSql = sql.replace(
+    /\bAS\s+([A-Za-z_][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*)\b/g,
+    'AS "$1"'
+  );
+  let output = "";
+  let parameter = 0;
+  let singleQuoted = false;
+  let doubleQuoted = false;
+
+  for (let i = 0; i < aliasSafeSql.length; i += 1) {
+    const character = aliasSafeSql[i];
+    const next = aliasSafeSql[i + 1];
+
+    if (singleQuoted) {
+      output += character;
+      if (character === "'" && next === "'") {
+        output += next;
+        i += 1;
+      } else if (character === "'") {
+        singleQuoted = false;
+      }
+      continue;
+    }
+    if (doubleQuoted) {
+      output += character;
+      if (character === '"' && next === '"') {
+        output += next;
+        i += 1;
+      } else if (character === '"') {
+        doubleQuoted = false;
+      }
+      continue;
+    }
+
+    if (character === "'") {
+      singleQuoted = true;
+      output += character;
+    } else if (character === '"') {
+      doubleQuoted = true;
+      output += character;
+    } else if (character === "?") {
+      parameter += 1;
+      output += `$${parameter}`;
+    } else {
+      output += character;
+    }
+  }
+  return output;
+}
+
+function createPostgresDatabase(connectionString) {
+  if (!connectionString) {
+    throw new Error("DATABASE_URL must be configured for PostgreSQL.");
+  }
+
+  const pool = new Pool({
+    connectionString,
+    max: 5,
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+    ...(connectionString.includes("supabase")
+      ? { ssl: { rejectUnauthorized: false } }
+      : {}),
+  });
+  const transactionContext = new AsyncLocalStorage();
+
+  async function query(sql, values = []) {
+    const client = transactionContext.getStore() || pool;
+    return client.query(postgresSql(sql), values);
+  }
+
+  return {
+    query,
+    prepare(sql) {
+      return {
+        async get(...values) {
+          const result = await query(sql, values);
+          return result.rows[0];
+        },
+        async all(...values) {
+          const result = await query(sql, values);
+          return result.rows;
+        },
+        async run(...values) {
+          let statement = sql;
+          // The old SQLite API exposed lastInsertRowid for these three inserts.
+          // RETURNING preserves that behavior when using PostgreSQL identity columns.
+          if (
+            /^\s*INSERT\s+INTO\s+(users|carts|addresses)\b/i.test(sql) &&
+            !/\bRETURNING\b/i.test(sql)
+          ) {
+            statement = `${sql.trim().replace(/;$/, "")} RETURNING id`;
+          }
+          const result = await query(statement, values);
+          return {
+            changes: result.rowCount ?? 0,
+            lastInsertRowid: result.rows?.[0]?.id,
+          };
+        },
+      };
+    },
+    transaction(callback) {
+      return async (...args) => {
+        // Support nesting defensively; this app's existing transactions are not nested.
+        if (transactionContext.getStore()) {
+          return callback(...args);
+        }
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const value = await transactionContext.run(client, () => callback(...args));
+          await client.query("COMMIT");
+          return value;
+        } catch (error) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // Keep the original transaction error.
+          }
+          throw error;
+        } finally {
+          client.release();
+        }
+      };
+    },
+    close() {
+      return pool.end();
+    },
+  };
+}
+
 export async function createAuthServer({
-  databasePath,
   cookieSecure = process.env.NODE_ENV === "production",
   verificationSender = deliverVerificationCode,
   staticRoot = existsSync(resolve(frontendDirectory, "index.html"))
@@ -235,224 +376,13 @@ export async function createAuthServer({
     throw new Error("OTP_SECRET must be configured in production.");
   }
 
-  const requestedDatabasePath =
-    databasePath || process.env.DATABASE_PATH || "data/mayleen.sqlite";
-  const resolvedDatabasePath =
-    requestedDatabasePath === ":memory:"
-      ? requestedDatabasePath
-      : resolve(projectRoot, requestedDatabasePath);
-
-  if (resolvedDatabasePath !== ":memory:") {
-    mkdirSync(dirname(resolvedDatabasePath), { recursive: true });
-  }
-
-  const database = new Database(resolvedDatabasePath);
-  database.pragma("journal_mode = WAL");
-  database.pragma("foreign_keys = ON");
-  database.pragma("busy_timeout = 5000");
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-      mobile TEXT NOT NULL UNIQUE,
-      password_salt TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS verification_codes (
-      channel TEXT NOT NULL CHECK(channel IN ('email', 'mobile')),
-      destination TEXT NOT NULL,
-      code_hash TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      verified_at INTEGER,
-      PRIMARY KEY (channel, destination)
-    );
-
-    CREATE TABLE IF NOT EXISTS password_reset_codes (
-      channel TEXT NOT NULL CHECK(channel IN ('email', 'mobile')),
-      destination TEXT NOT NULL,
-      code_hash TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      verified_at INTEGER,
-      PRIMARY KEY (channel, destination)
-    );
-
-    -- Cart tables for persistent customer carts
-    CREATE TABLE IF NOT EXISTS carts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS cart_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      cart_id INTEGER NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
-      product_id TEXT NOT NULL,
-      product_name TEXT NOT NULL,
-      product_category TEXT NOT NULL,
-      product_pack_size TEXT,
-      product_color TEXT,
-      quantity INTEGER NOT NULL DEFAULT 1,
-      unit_price INTEGER,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      UNIQUE(cart_id, product_id)
-    );
-
-    -- Order tables
-    CREATE TABLE IF NOT EXISTS orders (
-      id TEXT PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      payment_status TEXT NOT NULL DEFAULT 'pending',
-      customer_name TEXT NOT NULL,
-      customer_email TEXT NOT NULL,
-      customer_mobile TEXT NOT NULL,
-      shipping_address TEXT NOT NULL,
-      shipping_city TEXT NOT NULL,
-      shipping_state TEXT NOT NULL,
-      shipping_pincode TEXT NOT NULL,
-      subtotal INTEGER NOT NULL,
-      total INTEGER NOT NULL,
-      currency TEXT NOT NULL DEFAULT 'INR',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      paid_at INTEGER,
-      shipped_at INTEGER,
-      delivered_at INTEGER,
-      cancelled_at INTEGER,
-      tracking_number TEXT,
-      carrier TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS order_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      product_id TEXT NOT NULL,
-      product_name TEXT NOT NULL,
-      product_category TEXT NOT NULL,
-      product_pack_size TEXT,
-      quantity INTEGER NOT NULL,
-      unit_price INTEGER NOT NULL,
-      line_total INTEGER NOT NULL
-    );
-
-    -- Payment tables
-    CREATE TABLE IF NOT EXISTS payments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      provider TEXT NOT NULL DEFAULT 'Razorpay',
-      provider_order_id TEXT,
-      provider_payment_id TEXT,
-      provider_signature TEXT,
-      amount INTEGER NOT NULL,
-      currency TEXT NOT NULL DEFAULT 'INR',
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL,
-      verified_at INTEGER
-    );
-
-    -- Addresses table for saved shipping addresses
-    CREATE TABLE IF NOT EXISTS addresses (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      address TEXT NOT NULL,
-      city TEXT NOT NULL,
-      state TEXT NOT NULL,
-      pincode TEXT NOT NULL,
-      is_default INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    -- Products table for catalog
-    CREATE TABLE IF NOT EXISTS products (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      mrp TEXT NOT NULL,  -- Stored as "₹2,499" format for display
-      pack_size TEXT,
-      image TEXT,
-      video TEXT,
-      short_description TEXT,
-      description TEXT,
-      highlights TEXT,  -- JSON array
-      ingredients TEXT, -- JSON array
-      stock INTEGER NOT NULL DEFAULT 999,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
-    CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
-    CREATE INDEX IF NOT EXISTS carts_user_id_idx ON carts(user_id);
-    CREATE INDEX IF NOT EXISTS cart_items_cart_id_idx ON cart_items(cart_id);
-    CREATE INDEX IF NOT EXISTS orders_user_id_idx ON orders(user_id);
-    CREATE INDEX IF NOT EXISTS orders_status_idx ON orders(status);
-    CREATE INDEX IF NOT EXISTS order_items_order_id_idx ON order_items(order_id);
-    CREATE INDEX IF NOT EXISTS payments_order_id_idx ON payments(order_id);
-    CREATE INDEX IF NOT EXISTS addresses_user_id_idx ON addresses(user_id);
-    CREATE INDEX IF NOT EXISTS products_category_idx ON products(category);
-    CREATE INDEX IF NOT EXISTS products_stock_idx ON products(stock);
-
-    -- Admin users table
-    CREATE TABLE IF NOT EXISTS admins (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-      name TEXT NOT NULL,
-      password_salt TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'admin',
-      is_active INTEGER NOT NULL DEFAULT 1,
-      last_login_at INTEGER,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    -- Admin sessions
-    CREATE TABLE IF NOT EXISTS admin_sessions (
-      token_hash TEXT PRIMARY KEY,
-      admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
-      expires_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    -- Audit logs
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      admin_id INTEGER REFERENCES admins(id) ON DELETE SET NULL,
-      action TEXT NOT NULL,
-      entity_type TEXT NOT NULL,
-      entity_id TEXT,
-      old_data TEXT,
-      new_data TEXT,
-      ip_address TEXT,
-      user_agent TEXT,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS admin_sessions_admin_id_idx ON admin_sessions(admin_id);
-    CREATE INDEX IF NOT EXISTS admin_sessions_expires_at_idx ON admin_sessions(expires_at);
-    CREATE INDEX IF NOT EXISTS audit_logs_admin_id_idx ON audit_logs(admin_id);
-    CREATE INDEX IF NOT EXISTS audit_logs_entity_idx ON audit_logs(entity_type, entity_id);
-    CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs(created_at);
-
-  `);
-  database.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(Date.now());
+  const database = createPostgresDatabase(process.env.DATABASE_URL);
+  // Fail fast if the Supabase connection is unavailable, and clean up expired sessions.
+  await database.query("SELECT 1");
+  // The hosted schema is created in Supabase SQL Editor. Keep this small additive
+  // migration here because the existing admin user-update route writes updated_at.
+  await database.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT");
+  await database.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(Date.now());
 
   const app = Fastify({
     logger,
@@ -543,7 +473,7 @@ export async function createAuthServer({
   });
 
   app.addHook("onClose", async () => {
-    database.close();
+    await database.close();
   });
 
   // Security: Log failed authentication attempts
@@ -597,7 +527,7 @@ export async function createAuthServer({
     // Check database connectivity
     let dbStatus = "ok";
     try {
-      database.prepare("SELECT 1").get();
+      await database.prepare("SELECT 1").get();
     } catch {
       dbStatus = "error";
     }
@@ -646,7 +576,7 @@ export async function createAuthServer({
       }
 
       const contactColumn = channel === "email" ? "email" : "mobile";
-      const existingUser = database
+      const existingUser = await database
         .prepare(`SELECT id FROM users WHERE ${contactColumn} = ?`)
         .get(destination);
 
@@ -667,10 +597,10 @@ export async function createAuthServer({
       }
 
       const now = Date.now();
-      database
+      await database
         .prepare("DELETE FROM verification_codes WHERE expires_at <= ?")
         .run(now);
-      database
+      await database
         .prepare(`
           INSERT INTO verification_codes
             (channel, destination, code_hash, expires_at, attempts, verified_at)
@@ -707,7 +637,7 @@ export async function createAuthServer({
         channel === "email"
           ? request.body.value.trim().toLowerCase()
           : request.body.value.replace(/\D/g, "");
-      const challenge = database
+      const challenge = await database
         .prepare(`
           SELECT code_hash AS codeHash, expires_at AS expiresAt,
             attempts, verified_at AS verifiedAt
@@ -731,7 +661,7 @@ export async function createAuthServer({
         hashVerificationCode(channel, destination, code)
       );
 
-      database
+      await database
         .prepare(`
           UPDATE verification_codes
           SET attempts = attempts + 1
@@ -743,7 +673,7 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "The verification code is incorrect." });
       }
 
-      database
+      await database
         .prepare(`
           UPDATE verification_codes
           SET verified_at = ?
@@ -783,7 +713,7 @@ export async function createAuthServer({
       }
 
       const contactColumn = channel === "email" ? "email" : "mobile";
-      const existingUser = database
+      const existingUser = await database
         .prepare(`SELECT id FROM users WHERE ${contactColumn} = ?`)
         .get(destination);
 
@@ -799,10 +729,10 @@ export async function createAuthServer({
         }
 
         const now = Date.now();
-        database
+        await database
           .prepare("DELETE FROM password_reset_codes WHERE expires_at <= ?")
           .run(now);
-        database
+        await database
           .prepare(`
             INSERT INTO password_reset_codes
               (channel, destination, code_hash, expires_at, attempts, verified_at)
@@ -840,7 +770,7 @@ export async function createAuthServer({
         channel === "email"
           ? request.body.value.trim().toLowerCase()
           : request.body.value.replace(/\D/g, "");
-      const challenge = database
+      const challenge = await database
         .prepare(`
           SELECT code_hash AS codeHash, expires_at AS expiresAt,
             attempts, verified_at AS verifiedAt
@@ -864,7 +794,7 @@ export async function createAuthServer({
         hashVerificationCode(`password-reset-${channel}`, destination, code)
       );
 
-      database
+      await database
         .prepare(`
           UPDATE password_reset_codes
           SET attempts = attempts + 1
@@ -876,7 +806,7 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "The recovery code is incorrect." });
       }
 
-      database
+      await database
         .prepare(`
           UPDATE password_reset_codes
           SET verified_at = ?
@@ -901,7 +831,7 @@ export async function createAuthServer({
         channel === "email"
           ? request.body.value.trim().toLowerCase()
           : request.body.value.replace(/\D/g, "");
-      const challenge = database
+      const challenge = await database
         .prepare(`
           SELECT expires_at AS expiresAt, verified_at AS verifiedAt,
             attempts
@@ -921,7 +851,7 @@ export async function createAuthServer({
       }
 
       const contactColumn = channel === "email" ? "email" : "mobile";
-      const user = database
+      const user = await database
         .prepare(`SELECT id, email, mobile FROM users WHERE ${contactColumn} = ?`)
         .get(destination);
 
@@ -932,8 +862,8 @@ export async function createAuthServer({
       }
 
       const password = await hashPassword(newPassword);
-      const updatePassword = database.transaction(() => {
-        const consumedChallenge = database
+      const updatePassword = database.transaction(async () => {
+        const consumedChallenge = await database
           .prepare(`
             DELETE FROM password_reset_codes
             WHERE channel = ? AND destination = ?
@@ -952,15 +882,15 @@ export async function createAuthServer({
           return false;
         }
 
-        database
+        await database
           .prepare(`
             UPDATE users
             SET password_salt = ?, password_hash = ?
             WHERE id = ?
           `)
           .run(password.salt, password.hash, user.id);
-        database.prepare("DELETE FROM sessions WHERE user_id = ?").run(user.id);
-        database
+        await database.prepare("DELETE FROM sessions WHERE user_id = ?").run(user.id);
+        await database
           .prepare(`
             DELETE FROM password_reset_codes
             WHERE (channel = 'email' AND destination = ?)
@@ -971,7 +901,7 @@ export async function createAuthServer({
         return true;
       });
 
-      if (!updatePassword()) {
+      if (!(await updatePassword())) {
         return reply.code(400).send({
           error: "Verify a current recovery code before changing your password.",
         });
@@ -1003,7 +933,7 @@ export async function createAuthServer({
       }
 
       const now = Date.now();
-      const emailVerification = database
+      const emailVerification = await database
         .prepare(`
           SELECT verified_at AS verifiedAt, expires_at AS expiresAt
           FROM verification_codes
@@ -1019,7 +949,7 @@ export async function createAuthServer({
         });
       }
 
-      const existingUser = database
+      const existingUser = await database
         .prepare("SELECT id FROM users WHERE email = ? OR mobile = ?")
         .get(email, mobile);
 
@@ -1033,14 +963,14 @@ export async function createAuthServer({
       let result;
 
       try {
-        result = database
+        result = await database
           .prepare(`
             INSERT INTO users (name, email, mobile, password_salt, password_hash)
             VALUES (?, ?, ?, ?, ?)
           `)
           .run(name, email, mobile, password.salt, password.hash);
       } catch (error) {
-        if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (error.code === "23505") {
           return reply
             .code(409)
             .send({ error: "An account with that email or mobile number already exists." });
@@ -1049,20 +979,20 @@ export async function createAuthServer({
         throw error;
       }
 
-      const user = database
+      const user = await database
         .prepare(`SELECT ${userFields} FROM users WHERE id = ?`)
         .get(result.lastInsertRowid);
       const token = randomBytes(32).toString("base64url");
       const expiresAt = Date.now() + sessionLifetimeSeconds * 1000;
 
-      database
+      await database
         .prepare(`
           INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
           VALUES (?, ?, ?, ?)
         `)
         .run(hashToken(token), user.id, expiresAt, Date.now());
 
-      database
+      await database
         .prepare(`
           DELETE FROM verification_codes
           WHERE channel = 'email' AND destination = ?
@@ -1087,7 +1017,7 @@ export async function createAuthServer({
       const mobile = identifier.replace(/\s/g, "");
       const isMobile = /^[0-9]{10}$/.test(mobile);
       const normalizedIdentifier = isMobile ? mobile : identifier.toLowerCase();
-      const user = database
+      const user = await database
         .prepare(`
           SELECT id, name, email, mobile, password_salt, password_hash,
             created_at AS createdAt
@@ -1111,10 +1041,10 @@ export async function createAuthServer({
       const token = randomBytes(32).toString("base64url");
       const expiresAt = Date.now() + sessionLifetimeSeconds * 1000;
 
-      database
+      await database
         .prepare("DELETE FROM sessions WHERE expires_at <= ?")
         .run(Date.now());
-      database
+      await database
         .prepare(`
           INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
           VALUES (?, ?, ?, ?)
@@ -1134,7 +1064,7 @@ export async function createAuthServer({
       return { user: null };
     }
 
-    const session = database
+    const session = await database
       .prepare(`
         SELECT ${userFields}, sessions.expires_at AS expiresAt
         FROM sessions
@@ -1144,7 +1074,7 @@ export async function createAuthServer({
       .get(hashToken(token), Date.now());
 
     if (!session) {
-      database
+      await database
         .prepare("DELETE FROM sessions WHERE token_hash = ?")
         .run(hashToken(token));
       reply.clearCookie(sessionCookieName, { path: "/", secure: cookieSecure });
@@ -1159,7 +1089,7 @@ export async function createAuthServer({
     const token = request.cookies[sessionCookieName];
 
     if (token) {
-      database
+      await database
         .prepare("DELETE FROM sessions WHERE token_hash = ?")
         .run(hashToken(token));
     }
@@ -1198,7 +1128,7 @@ export async function createAuthServer({
       const { email, password } = request.body;
       const normalizedEmail = email.trim().toLowerCase();
 
-      const admin = database
+      const admin = await database
         .prepare(
           `SELECT id, name, email, password_salt, password_hash, role, is_active
            FROM admins WHERE email = ?`
@@ -1220,17 +1150,17 @@ export async function createAuthServer({
       const token = randomBytes(32).toString("base64url");
       const expiresAt = Date.now() + sessionLifetimeSeconds * 1000;
 
-      database
+      await database
         .prepare("DELETE FROM admin_sessions WHERE expires_at <= ?")
         .run(Date.now());
-      database
+      await database
         .prepare(
           `INSERT INTO admin_sessions (token_hash, admin_id, expires_at, created_at)
            VALUES (?, ?, ?, ?)`
         )
         .run(hashAdminToken(token), admin.id, expiresAt, Date.now());
 
-      database
+      await database
         .prepare(`UPDATE admins SET last_login_at = ? WHERE id = ?`)
         .run(Date.now(), admin.id);
 
@@ -1256,7 +1186,7 @@ export async function createAuthServer({
       return { admin: null };
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT a.id, a.name, a.email, a.role, a.is_active, s.expires_at AS expiresAt
          FROM admin_sessions s
@@ -1266,7 +1196,7 @@ export async function createAuthServer({
       .get(hashAdminToken(token), Date.now());
 
     if (!session) {
-      database
+      await database
         .prepare("DELETE FROM admin_sessions WHERE token_hash = ?")
         .run(hashAdminToken(token));
       reply.clearCookie(adminSessionCookieName, { path: "/", secure: cookieSecure });
@@ -1282,7 +1212,7 @@ export async function createAuthServer({
     const token = request.cookies[adminSessionCookieName];
 
     if (token) {
-      database
+      await database
         .prepare("DELETE FROM admin_sessions WHERE token_hash = ?")
         .run(hashAdminToken(token));
     }
@@ -1298,7 +1228,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Admin authentication required." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT a.id, a.name, a.email, a.role, a.is_active, s.expires_at AS expiresAt
          FROM admin_sessions s
@@ -1317,7 +1247,7 @@ export async function createAuthServer({
 
   // Audit log helper
   async function logAudit(adminId, action, entityType, entityId, oldData, newData, request) {
-    database
+    await database
       .prepare(`
         INSERT INTO audit_logs (admin_id, action, entity_type, entity_id, old_data, new_data, ip_address, user_agent, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1363,10 +1293,10 @@ export async function createAuthServer({
   };
 
   async function getOrCreateCart(userId) {
-    let cart = database.prepare("SELECT id FROM carts WHERE user_id = ?").get(userId);
+    let cart = await database.prepare("SELECT id FROM carts WHERE user_id = ?").get(userId);
     const now = Date.now();
     if (!cart) {
-      const result = database
+      const result = await database
         .prepare("INSERT INTO carts (user_id, created_at, updated_at) VALUES (?, ?, ?)")
         .run(userId, now, now);
       cart = { id: result.lastInsertRowid };
@@ -1382,7 +1312,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -1393,7 +1323,7 @@ export async function createAuthServer({
     }
 
     const cart = await getOrCreateCart(session.user_id);
-    const items = database
+    const items = await database
       .prepare(
         `SELECT id, product_id AS productId, product_name AS productName,
           product_category AS productCategory, product_pack_size AS productPackSize,
@@ -1419,7 +1349,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1436,7 +1366,7 @@ export async function createAuthServer({
       const unitPrice = getProductPrice(productId);
 
       const now = Date.now();
-      database
+      await database
         .prepare(`
           INSERT INTO cart_items (cart_id, product_id, product_name, product_category, product_pack_size, product_color, quantity, unit_price, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1446,7 +1376,7 @@ export async function createAuthServer({
         `)
         .run(cart.id, productId, productName, productCategory, productPackSize || null, productColor || null, quantity, unitPrice, now, now);
 
-      database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
+      await database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
 
       return reply.code(201).send({ success: true });
     }
@@ -1465,7 +1395,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1475,7 +1405,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Session expired." });
       }
 
-      const cart = database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
+      const cart = await database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
       if (!cart) {
         return reply.code(404).send({ error: "Cart not found." });
       }
@@ -1485,9 +1415,9 @@ export async function createAuthServer({
       const now = Date.now();
 
       if (quantity === 0) {
-        database.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cart.id, productId);
+        await database.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cart.id, productId);
       } else {
-        const result = database
+        const result = await database
           .prepare("UPDATE cart_items SET quantity = ?, updated_at = ? WHERE cart_id = ? AND product_id = ?")
           .run(quantity, now, cart.id, productId);
         if (result.changes === 0) {
@@ -1495,7 +1425,7 @@ export async function createAuthServer({
         }
       }
 
-      database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
+      await database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
       return { success: true };
     }
   );
@@ -1510,7 +1440,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1520,16 +1450,16 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Session expired." });
       }
 
-      const cart = database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
+      const cart = await database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
       if (!cart) {
         return reply.code(404).send({ error: "Cart not found." });
       }
 
       const { productId } = request.params;
-      database.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cart.id, productId);
+      await database.prepare("DELETE FROM cart_items WHERE cart_id = ? AND product_id = ?").run(cart.id, productId);
 
       const now = Date.now();
-      database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
+      await database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
       return { success: true };
     }
   );
@@ -1544,7 +1474,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1554,11 +1484,11 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Session expired." });
       }
 
-      const cart = database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
+      const cart = await database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
       if (cart) {
-        database.prepare("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
+        await database.prepare("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
         const now = Date.now();
-        database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
+        await database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
       }
       return { success: true };
     }
@@ -1593,7 +1523,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1603,7 +1533,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Session expired." });
       }
 
-      const user = database
+      const user = await database
         .prepare(`SELECT id, name, email, mobile FROM users WHERE id = ?`)
         .get(session.user_id);
 
@@ -1611,12 +1541,12 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "User not found." });
       }
 
-      const cart = database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
+      const cart = await database.prepare("SELECT id FROM carts WHERE user_id = ?").get(session.user_id);
       if (!cart) {
         return reply.code(400).send({ error: "Cart is empty." });
       }
 
-      const cartItems = database
+      const cartItems = await database
         .prepare(
           `SELECT product_id, product_name, product_category, product_pack_size, quantity, unit_price
            FROM cart_items WHERE cart_id = ?`
@@ -1642,9 +1572,9 @@ export async function createAuthServer({
       const orderId = "ORD-" + Date.now() + "-" + randomBytes(4).toString("hex");
       const now = Date.now();
 
-      const createOrder = database.transaction(() => {
+      const createOrder = database.transaction(async () => {
         // Create order
-        database
+        await database
           .prepare(`
             INSERT INTO orders (
               id, user_id, status, payment_status,
@@ -1674,7 +1604,7 @@ export async function createAuthServer({
 
         // Create order items
         for (const item of cartItems) {
-          database
+          await database
             .prepare(`
               INSERT INTO order_items (order_id, product_id, product_name, product_category, product_pack_size, quantity, unit_price, line_total)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1692,11 +1622,11 @@ export async function createAuthServer({
         }
 
         // Clear cart
-        database.prepare("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
-        database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
+        await database.prepare("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
+        await database.prepare("UPDATE carts SET updated_at = ? WHERE id = ?").run(now, cart.id);
       });
 
-      createOrder();
+      await createOrder();
 
       return reply.code(201).send({
         orderId,
@@ -1715,7 +1645,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -1725,7 +1655,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Session expired." });
     }
 
-    const orders = database
+    const orders = await database
       .prepare(`
         SELECT id, status, payment_status, subtotal, total, currency, created_at AS createdAt
         FROM orders WHERE user_id = ? ORDER BY created_at DESC
@@ -1743,7 +1673,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -1754,7 +1684,7 @@ export async function createAuthServer({
     }
 
     const { orderId } = request.params;
-    const order = database
+    const order = await database
       .prepare(`
         SELECT id, status, payment_status, customer_name, customer_email, customer_mobile,
           shipping_address, shipping_city, shipping_state, shipping_pincode,
@@ -1767,14 +1697,14 @@ export async function createAuthServer({
       return reply.code(404).send({ error: "Order not found." });
     }
 
-    const items = database
+    const items = await database
       .prepare(`
         SELECT product_id, product_name, product_category, product_pack_size, quantity, unit_price, line_total
         FROM order_items WHERE order_id = ?
       `)
       .all(orderId);
 
-    const payment = database
+    const payment = await database
       .prepare(`
         SELECT provider, provider_order_id, provider_payment_id, amount, status, created_at, verified_at
         FROM payments WHERE order_id = ?
@@ -1801,7 +1731,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1816,7 +1746,7 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "Order ID required." });
       }
 
-      const order = database
+      const order = await database
         .prepare(
           `SELECT id, total, currency, payment_status FROM orders WHERE id = ? AND user_id = ?`
         )
@@ -1858,7 +1788,7 @@ export async function createAuthServer({
 
       // Store payment record
       const now = Date.now();
-      database
+      await database
         .prepare(`
           INSERT INTO payments (order_id, provider, provider_order_id, amount, currency, status, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1884,7 +1814,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -1900,7 +1830,7 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "Missing payment verification fields." });
       }
 
-      const order = database
+      const order = await database
         .prepare(
           `SELECT id, total, payment_status FROM orders WHERE id = ? AND user_id = ?`
         )
@@ -1950,8 +1880,8 @@ export async function createAuthServer({
 
       // Update payment and order atomically
       const now = Date.now();
-      const updatePayment = database.transaction(() => {
-        database
+      const updatePayment = database.transaction(async () => {
+        await database
           .prepare(`
             UPDATE payments
             SET provider_payment_id = ?, provider_signature = ?, status = ?, verified_at = ?
@@ -1959,7 +1889,7 @@ export async function createAuthServer({
           `)
           .run(razorpayPaymentId, razorpaySignature, "paid", now, razorpayOrderId, order.id);
 
-        database
+        await database
           .prepare(`
             UPDATE orders
             SET payment_status = ?, status = ?, paid_at = ?, updated_at = ?
@@ -1968,7 +1898,7 @@ export async function createAuthServer({
           .run("paid", "confirmed", now, now, order.id);
       });
 
-      updatePayment();
+      await updatePayment();
 
       return { success: true, paymentId: razorpayPaymentId };
     }
@@ -1999,14 +1929,14 @@ export async function createAuthServer({
         const providerPaymentId = payment.id;
         const status = payment.status;
 
-        const paymentRecord = database
+        const paymentRecord = await database
           .prepare(`SELECT * FROM payments WHERE provider_order_id = ?`)
           .get(providerOrderId);
 
         if (paymentRecord && paymentRecord.status !== "paid") {
           if (status === "captured" || status === "authorized") {
             const now = Date.now();
-            database
+            await database
               .prepare(`
                 UPDATE payments
                 SET provider_payment_id = ?, status = ?, verified_at = ?
@@ -2014,7 +1944,7 @@ export async function createAuthServer({
               `)
               .run(providerPaymentId, "paid", now, providerOrderId);
 
-            database
+            await database
               .prepare(`
                 UPDATE orders
                 SET payment_status = ?, status = ?, paid_at = ?, updated_at = ?
@@ -2023,7 +1953,7 @@ export async function createAuthServer({
               .run("paid", "confirmed", now, now, paymentRecord.order_id);
           } else if (status === "failed") {
             const now = Date.now();
-            database
+            await database
               .prepare(`
                 UPDATE payments
                 SET status = ?, verified_at = ?
@@ -2031,7 +1961,7 @@ export async function createAuthServer({
               `)
               .run("failed", now, providerOrderId);
 
-            database
+            await database
               .prepare(`
                 UPDATE orders
                 SET payment_status = ?, updated_at = ?
@@ -2081,7 +2011,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -2091,7 +2021,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Session expired." });
     }
 
-    const user = database
+    const user = await database
       .prepare(`SELECT id, name, email, mobile, created_at AS createdAt FROM users WHERE id = ?`)
       .get(session.user_id);
 
@@ -2113,7 +2043,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2124,11 +2054,11 @@ export async function createAuthServer({
       }
 
       const { name } = request.body;
-      database
+      await database
         .prepare(`UPDATE users SET name = ? WHERE id = ?`)
         .run(name, session.user_id);
 
-      const user = database
+      const user = await database
         .prepare(`SELECT id, name, email, mobile, created_at AS createdAt FROM users WHERE id = ?`)
         .get(session.user_id);
 
@@ -2144,7 +2074,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -2154,7 +2084,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Session expired." });
     }
 
-    const addresses = database
+    const addresses = await database
       .prepare(`SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC`)
       .all(session.user_id);
 
@@ -2172,7 +2102,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2187,17 +2117,17 @@ export async function createAuthServer({
 
       // If this is default, unset other defaults
       if (isDefault) {
-        database.prepare(`UPDATE addresses SET is_default = 0 WHERE user_id = ?`).run(session.user_id);
+        await database.prepare(`UPDATE addresses SET is_default = 0 WHERE user_id = ?`).run(session.user_id);
       }
 
-      const result = database
+      const result = await database
         .prepare(`
           INSERT INTO addresses (user_id, name, phone, address, city, state, pincode, is_default, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(session.user_id, name, phone, address, city, state, pincode, isDefault ? 1 : 0, now, now);
 
-      const newAddress = database.prepare(`SELECT * FROM addresses WHERE id = ?`).get(result.lastInsertRowid);
+      const newAddress = await database.prepare(`SELECT * FROM addresses WHERE id = ?`).get(result.lastInsertRowid);
       return reply.code(201).send({ address: newAddress });
     }
   );
@@ -2213,7 +2143,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2227,7 +2157,7 @@ export async function createAuthServer({
       const { name, phone, address, city, state, pincode, isDefault } = request.body;
       const now = Date.now();
 
-      const existing = database
+      const existing = await database
         .prepare(`SELECT * FROM addresses WHERE id = ? AND user_id = ?`)
         .get(addressId, session.user_id);
 
@@ -2237,10 +2167,10 @@ export async function createAuthServer({
 
       // If this is default, unset other defaults
       if (isDefault) {
-        database.prepare(`UPDATE addresses SET is_default = 0 WHERE user_id = ?`).run(session.user_id);
+        await database.prepare(`UPDATE addresses SET is_default = 0 WHERE user_id = ?`).run(session.user_id);
       }
 
-      database
+      await database
         .prepare(`
           UPDATE addresses
           SET name = ?, phone = ?, address = ?, city = ?, state = ?, pincode = ?, is_default = ?, updated_at = ?
@@ -2248,7 +2178,7 @@ export async function createAuthServer({
         `)
         .run(name, phone, address, city, state, pincode, isDefault ? 1 : 0, now, addressId, session.user_id);
 
-      const updated = database.prepare(`SELECT * FROM addresses WHERE id = ?`).get(addressId);
+      const updated = await database.prepare(`SELECT * FROM addresses WHERE id = ?`).get(addressId);
       return { address: updated };
     }
   );
@@ -2263,7 +2193,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2274,7 +2204,7 @@ export async function createAuthServer({
       }
 
       const { addressId } = request.params;
-      const existing = database
+      const existing = await database
         .prepare(`SELECT * FROM addresses WHERE id = ? AND user_id = ?`)
         .get(addressId, session.user_id);
 
@@ -2282,7 +2212,7 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "Address not found." });
       }
 
-      database.prepare(`DELETE FROM addresses WHERE id = ? AND user_id = ?`).run(addressId, session.user_id);
+      await database.prepare(`DELETE FROM addresses WHERE id = ? AND user_id = ?`).run(addressId, session.user_id);
       return { success: true };
     }
   );
@@ -2300,7 +2230,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2310,7 +2240,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Session expired." });
       }
 
-      database.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(session.user_id);
+      await database.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(session.user_id);
       reply.clearCookie(sessionCookieName, { path: "/", secure: cookieSecure });
       return { success: true, message: "Logged out from all devices." };
     }
@@ -2360,7 +2290,7 @@ export async function createAuthServer({
 
     query += ` ORDER BY category, name`;
 
-    const products = database.prepare(query).all(...params);
+    const products = await database.prepare(query).all(...params);
 
     // Convert prices to paise and parse JSON fields
     const formattedProducts = products.map(p => ({
@@ -2380,7 +2310,7 @@ export async function createAuthServer({
     reply.header("Cache-Control", "no-store");
     const { productId } = request.params;
 
-    const product = database.prepare(`
+    const product = await database.prepare(`
       SELECT id, name, category, mrp, pack_size AS packSize,
              image, video, short_description AS shortDescription,
              description, highlights, ingredients, stock,
@@ -2407,7 +2337,7 @@ export async function createAuthServer({
   // Get categories
   app.get("/api/products/categories", async (request, reply) => {
     reply.header("Cache-Control", "no-store");
-    const categories = database.prepare(`
+    const categories = await database.prepare(`
       SELECT DISTINCT category FROM products ORDER BY category
     `).all();
 
@@ -2429,12 +2359,12 @@ export async function createAuthServer({
       const now = Date.now();
       const oldData = null;
       try {
-        database.prepare(`
+        await database.prepare(`
           INSERT INTO products (id, name, category, mrp, pack_size, image, video, short_description, description, highlights, ingredients, stock, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(id, name, category, mrp, packSize || null, image || null, video || null, shortDescription || null, description || null, highlights || null, ingredients || null, stock || 999, now, now);
       } catch (e) {
-        if (e.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (e.code === "23505") {
           return reply.code(409).send({ error: "Product ID already exists." });
         }
         throw e;
@@ -2454,7 +2384,7 @@ export async function createAuthServer({
       const { productId } = request.params;
       const body = request.body;
 
-      const oldProduct = database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
+      const oldProduct = await database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
       if (!oldProduct) {
         return reply.code(404).send({ error: "Product not found." });
       }
@@ -2481,7 +2411,7 @@ export async function createAuthServer({
       values.push(Date.now());
       values.push(productId);
 
-      const result = database.prepare(`
+      const result = await database.prepare(`
         UPDATE products SET ${updates.join(", ")} WHERE id = ?
       `).run(...values);
 
@@ -2489,7 +2419,7 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "Product not found." });
       }
 
-      const newProduct = database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
+      const newProduct = await database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
       await logAudit(request.admin.id, "update", "product", productId, oldProduct, newProduct, request);
       return { success: true };
     }
@@ -2508,12 +2438,12 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "Invalid stock value." });
       }
 
-      const oldProduct = database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
+      const oldProduct = await database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
       if (!oldProduct) {
         return reply.code(404).send({ error: "Product not found." });
       }
 
-      const result = database.prepare(`
+      const result = await database.prepare(`
         UPDATE products SET stock = ?, updated_at = ? WHERE id = ?
       `).run(stock, Date.now(), productId);
 
@@ -2521,7 +2451,7 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "Product not found." });
       }
 
-      const newProduct = database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
+      const newProduct = await database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
       await logAudit(request.admin.id, "update_stock", "product", productId, { stock: oldProduct.stock }, { stock }, request);
       return { success: true, stock };
     }
@@ -2535,12 +2465,12 @@ export async function createAuthServer({
       reply.header("Cache-Control", "no-store");
       const { productId } = request.params;
 
-      const oldProduct = database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
+      const oldProduct = await database.prepare(`SELECT * FROM products WHERE id = ?`).get(productId);
       if (!oldProduct) {
         return reply.code(404).send({ error: "Product not found." });
       }
 
-      const result = database
+      const result = await database
         .prepare(`DELETE FROM products WHERE id = ?`)
         .run(productId);
 
@@ -2631,7 +2561,7 @@ export async function createAuthServer({
       return reply.code(401).send({ error: "Not authenticated." });
     }
 
-    const session = database
+    const session = await database
       .prepare(
         `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
       )
@@ -2642,7 +2572,7 @@ export async function createAuthServer({
     }
 
     const { orderId } = request.params;
-    const order = database
+    const order = await database
       .prepare(
         `SELECT id, status, payment_status, created_at, updated_at, paid_at, shipped_at, delivered_at
          FROM orders WHERE id = ? AND user_id = ?`
@@ -2689,7 +2619,7 @@ export async function createAuthServer({
         return reply.code(400).send({ error: "Invalid status." });
       }
 
-      const oldOrder = database.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+      const oldOrder = await database.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
       if (!oldOrder) {
         return reply.code(404).send({ error: "Order not found." });
       }
@@ -2710,7 +2640,7 @@ export async function createAuthServer({
       const setClause = Object.keys(updates).map(k => `${k} = ?`).join(", ");
       const values = [...Object.values(updates), orderId];
 
-      const result = database
+      const result = await database
         .prepare(`UPDATE orders SET ${setClause} WHERE id = ?`)
         .run(...values);
 
@@ -2718,7 +2648,7 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "Order not found." });
       }
 
-      const newOrder = database.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
+      const newOrder = await database.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId);
       await logAudit(request.admin.id, "update_status", "order", orderId, oldOrder, newOrder, request);
       return { success: true, status };
     }
@@ -2757,7 +2687,7 @@ export async function createAuthServer({
         return reply.code(401).send({ error: "Not authenticated." });
       }
 
-      const session = database
+      const session = await database
         .prepare(
           `SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?`
         )
@@ -2770,7 +2700,7 @@ export async function createAuthServer({
     const { orderId } = request.params;
     const { reason, items } = request.body;
 
-    const order = database
+    const order = await database
       .prepare(
         `SELECT id, status, payment_status, total FROM orders WHERE id = ? AND user_id = ?`
       )
@@ -2790,7 +2720,7 @@ export async function createAuthServer({
     }
 
     // Check if within 7 days of delivery
-    const deliveredAt = database
+    const deliveredAt = await database
       .prepare(`SELECT delivered_at FROM orders WHERE id = ?`)
       .get(orderId);
     if (deliveredAt?.delivered_at) {
@@ -2805,7 +2735,7 @@ export async function createAuthServer({
 
     // Create return record (reuse payments table with negative amount or create returns table)
     // For now, just update order status
-    database
+    await database
       .prepare(`UPDATE orders SET status = 'return_requested', updated_at = ? WHERE id = ?`)
       .run(now, orderId);
 
@@ -2893,7 +2823,7 @@ export async function createAuthServer({
       query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
       params.push(limit, offset);
 
-      const users = database.prepare(query).all(...params);
+      const users = await database.prepare(query).all(...params);
 
       // Get total count
       let countQuery = `SELECT COUNT(*) as total FROM users`;
@@ -2902,7 +2832,7 @@ export async function createAuthServer({
         countQuery += ` WHERE name LIKE ? OR email LIKE ? OR mobile LIKE ?`;
         countParams.push(searchTerm, searchTerm, searchTerm);
       }
-      const total = database.prepare(countQuery).get(...countParams).total;
+      const total = (await database.prepare(countQuery).get(...countParams)).total;
 
       return { users, total, page: Number(page), limit: Number(limit) };
     }
@@ -2916,7 +2846,7 @@ export async function createAuthServer({
       reply.header("Cache-Control", "no-store");
       const { userId } = request.params;
 
-      const user = database
+      const user = await database
         .prepare(`SELECT id, name, email, mobile, created_at AS createdAt FROM users WHERE id = ?`)
         .get(userId);
 
@@ -2925,12 +2855,12 @@ export async function createAuthServer({
       }
 
       // Get user's orders
-      const orders = database
+      const orders = await database
         .prepare(`SELECT id, status, payment_status, total, created_at AS createdAt FROM orders WHERE user_id = ? ORDER BY created_at DESC`)
         .all(userId);
 
       // Get user's addresses
-      const addresses = database
+      const addresses = await database
         .prepare(`SELECT * FROM addresses WHERE user_id = ?`)
         .all(userId);
 
@@ -2947,7 +2877,7 @@ export async function createAuthServer({
       const { userId } = request.params;
       const { is_active, name } = request.body;
 
-      const oldUser = database.prepare(`SELECT * FROM users WHERE id = ?`).get(userId);
+      const oldUser = await database.prepare(`SELECT * FROM users WHERE id = ?`).get(userId);
       if (!oldUser) {
         return reply.code(404).send({ error: "User not found." });
       }
@@ -2961,11 +2891,10 @@ export async function createAuthServer({
       }
 
       if (updates.length > 0) {
-        values.push(userId);
-        database.prepare(`UPDATE users SET ${updates.join(", ")}, updated_at = ? WHERE id = ?`).run(...values, Date.now(), userId);
+        await database.prepare(`UPDATE users SET ${updates.join(", ")}, updated_at = ? WHERE id = ?`).run(...values, Date.now(), userId);
       }
 
-      const newUser = database.prepare(`SELECT id, name, email, mobile, created_at AS createdAt FROM users WHERE id = ?`).get(userId);
+      const newUser = await database.prepare(`SELECT id, name, email, mobile, created_at AS createdAt FROM users WHERE id = ?`).get(userId);
       await logAudit(request.admin.id, "update", "user", userId, oldUser, newUser, request);
       return { user: newUser };
     }
@@ -3006,7 +2935,7 @@ export async function createAuthServer({
       query += ` ORDER BY o.created_at DESC LIMIT ? OFFSET ?`;
       params.push(limit, offset);
 
-      const orders = database.prepare(query).all(...params);
+      const orders = await database.prepare(query).all(...params);
 
       // Get total count
       let countQuery = `SELECT COUNT(*) as total FROM orders o`;
@@ -3015,7 +2944,7 @@ export async function createAuthServer({
         countQuery += ` WHERE ` + conditions.join(" AND ");
         countParams.push(...params.slice(0, -2));
       }
-      const total = database.prepare(countQuery).get(...countParams).total;
+      const total = (await database.prepare(countQuery).get(...countParams)).total;
 
       return { orders, total, page: Number(page), limit: Number(limit) };
     }
@@ -3029,7 +2958,7 @@ export async function createAuthServer({
       reply.header("Cache-Control", "no-store");
       const { orderId } = request.params;
 
-      const order = database
+      const order = await database
         .prepare(`
           SELECT id, status, payment_status, customer_name, customer_email, customer_mobile,
             shipping_address, shipping_city, shipping_state, shipping_pincode,
@@ -3044,14 +2973,14 @@ export async function createAuthServer({
         return reply.code(404).send({ error: "Order not found." });
       }
 
-      const items = database
+      const items = await database
         .prepare(`
           SELECT product_id, product_name, product_category, product_pack_size, quantity, unit_price, line_total
           FROM order_items WHERE order_id = ?
         `)
         .all(orderId);
 
-      const payment = database
+      const payment = await database
         .prepare(`
           SELECT provider, provider_order_id, provider_payment_id, provider_signature, amount, status, created_at, verified_at
           FROM payments WHERE order_id = ?
@@ -3095,7 +3024,7 @@ export async function createAuthServer({
       query += ` ORDER BY p.created_at DESC LIMIT ? OFFSET ?`;
       params.push(limit, offset);
 
-      const payments = database.prepare(query).all(...params);
+      const payments = await database.prepare(query).all(...params);
 
       // Get total count
       let countQuery = `SELECT COUNT(*) as total FROM payments p JOIN orders o ON o.id = p.order_id`;
@@ -3104,7 +3033,7 @@ export async function createAuthServer({
         countQuery += ` WHERE ` + conditions.join(" AND ");
         countParams.push(...params.slice(0, -2));
       }
-      const total = database.prepare(countQuery).get(...countParams).total;
+      const total = (await database.prepare(countQuery).get(...countParams)).total;
 
       return { payments, total, page: Number(page), limit: Number(limit) };
     }
@@ -3155,7 +3084,7 @@ export async function createAuthServer({
       query += ` ORDER BY al.created_at DESC LIMIT ? OFFSET ?`;
       params.push(limit, offset);
 
-      const logs = database.prepare(query).all(...params);
+      const logs = await database.prepare(query).all(...params);
 
       // Parse JSON data
       const formattedLogs = logs.map(log => ({
@@ -3169,9 +3098,9 @@ export async function createAuthServer({
       const countParams = [];
       if (conditions.length > 0) {
         countQuery += ` WHERE ` + conditions.join(" AND ");
-        countParams.push(...params);
+        countParams.push(...params.slice(0, -2));
       }
-      const total = database.prepare(countQuery).get(...countParams).total;
+      const total = (await database.prepare(countQuery).get(...countParams)).total;
 
       return { logs: formattedLogs, total, page: Number(page), limit: Number(limit) };
     }
